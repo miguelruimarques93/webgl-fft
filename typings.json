@@ -1,0 +1,7 @@
+{
+  "name": "wegl-fft-js",
+  "dependencies": {},
+  "globalDependencies": {
+    "THREE": "registry:dt/three#0.0.0+20160523041317"
+  }
+}

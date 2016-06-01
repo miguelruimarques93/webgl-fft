@@ -1,0 +1,620 @@
+import THREE from 'three';
+import { FFT, FrequencyFilter } from 'fft.js';
+import vs_fft from './shaders/vs_fft.2.vs!text';
+import fs_fft from './shaders/fs_fft.2.fs!text';
+
+function appendImageToBody(image) {
+    var img = document.createElement('img');
+    img.src = image;
+    document.body.appendChild(img);
+}
+
+function create_canvas_from_matrix(matrix) {
+    return create_canvas_from_matrix_(matrix.re, matrix.width, matrix.height, matrix.channels);
+}
+
+function create_canvas_from_matrix_(src, width, height, channels) {
+  var canvas = document.createElement('canvas');
+  
+  canvas.width = width;
+  canvas.height = height;
+  
+  canvas.style.width = width + 'px';
+  canvas.style.height = height + 'px';
+  
+  var context = canvas.getContext('2d');
+  var imageData = context.getImageData(0, 0, width, height);
+  var data = imageData.data;
+  var src_buffer = src;
+  var incr = channels;
+  
+  for (var i = 0, j = 0; i < data.length; i += 4, j += incr) {
+    data[i] = src_buffer[j];
+    
+    if (incr == 3) {
+      data[i + 1] = src_buffer[j + 1];
+      data[i + 2] = src_buffer[j + 2];
+    } else {
+      data[i + 1] = src_buffer[j];
+      data[i + 2] = src_buffer[j];
+    }
+    
+    data[i + 3] = 255;
+  }
+  
+  context.putImageData(imageData, 0, 0);
+  
+  return canvas.toDataURL();
+}
+
+function createTextureFromData (renderer, width, height, data ) {
+    var gl = renderer.context;
+    
+    /*if (!gl.getExtension("OES_texture_float")) {
+        throw("Requires OES_texture_float extension");
+    }*/
+    
+    var texture = new THREE.Texture( );
+    texture.needsUpdate = false;
+    var texprops = renderer.properties.get(texture);
+    texprops.__webglTexture = gl.createTexture();
+
+    gl.bindTexture( gl.TEXTURE_2D, texprops.__webglTexture );
+
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, new Float32Array(data) );
+    texture.__webglInit = false;
+
+    gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE );
+    gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE );
+    gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST );
+    gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST_MIPMAP_NEAREST );
+    // gl.generateMipmap( gl.TEXTURE_2D );
+    gl.bindTexture( gl.TEXTURE_2D, null )
+
+    return texture;
+}
+
+class webgl_fft
+{
+    constructor()
+    {
+        var canvas = document.createElement('canvas');
+        var gl = canvas.getContext('webgl2');
+        
+        this.renderer = new THREE.WebGLRenderer({ context: gl, canvas });
+        // this.renderer.context.getExtension('OES_texture_float');
+        this.renderer.context.getExtension('OES_texture_float_linear');
+        this.renderer.setClearColor(0x000000);
+
+        console.log(this.renderer.context);
+
+        this.scene = new THREE.Scene();
+
+        var geometry = new THREE.BufferGeometry();
+
+        var vertices = new Float32Array([
+            -1,  1, 0,
+            1,  1, 0,
+            -1, -1, 0,
+            1, -1, 0
+        ]);
+
+        var indices = new Uint32Array([ 0, 2, 1, 2, 3, 1]);
+
+        geometry.addAttribute('position', new THREE.BufferAttribute(vertices, 3));
+        geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+
+        geometry.computeBoundingSphere();
+
+        var mesh = new THREE.Mesh(geometry);
+
+        this.scene.add(mesh);
+
+        this.fft_camera = new THREE.OrthographicCamera();
+        this.fft_camera.position.z = 1;
+
+        this.horizontal_fft_material = new THREE.RawShaderMaterial({
+            uniforms: {
+                "u_input": { type: "t", value: null },
+                "u_transformSize": { type: "f", value: null },
+                "u_subtransformSize": { type: "f", value: null }
+            },
+            vertexShader: vs_fft,
+            fragmentShader: "#define HORIZONTAL \n" + fs_fft
+        });
+
+        this.vertical_fft_material = new THREE.RawShaderMaterial({
+            uniforms: {
+                "u_input": { type: "t", value: null },
+                "u_transformSize": { type: "f", value: null },
+                "u_subtransformSize": { type: "f", value: null }
+            },
+            vertexShader: vs_fft,
+            fragmentShader: fs_fft
+        });
+
+        var BaseParams = {
+            format: THREE.RGBAFormat,
+            stencilBuffer: false,
+            depthBuffer: false,
+            premultiplyAlpha: false,
+            type: THREE.FloatType
+        };
+
+        this.NearestClampParams = JSON.parse(JSON.stringify(BaseParams));
+        this.NearestClampParams.minFilter = this.NearestClampParams.magFilter = THREE.NearestFilter ;
+        this.NearestClampParams.wrapS = this.NearestClampParams.wrapT = THREE.ClampToEdgeWrapping ;
+
+        this.LinearRepeatParams = JSON.parse(JSON.stringify(BaseParams));
+        this.LinearRepeatParams.minFilter = this.LinearRepeatParams.magFilter = THREE.LinearFilter ;
+        this.LinearRepeatParams.wrapS = this.LinearRepeatParams.wrapT = THREE.RepeatWrapping ;
+    }
+    
+    calculate(matrix)
+    {
+        var perf = performance.now();
+        
+        var resolution_x = matrix.width;
+        var resolution_y = matrix.height;
+        
+        var max_size = 4 * matrix.re.length;
+        var image = [];
+        for (var i = 0, j = 0; i < max_size; i += 4, ++j)
+        {
+            image[i] = matrix.re[j];
+            image[i+1] = matrix.im[j];
+            image[i+2] = 0;
+            image[i+3] = 0;
+        }
+        
+        
+        this.horizontal_fft_material.uniforms.u_transformSize.value = resolution_x;
+        this.vertical_fft_material.uniforms.u_transformSize.value = resolution_y;
+        
+        var texture = createTextureFromData(this.renderer, resolution_x, resolution_y, image);
+    
+        console.log(`Uploading took ${performance.now() - perf}`);
+    
+        texture.repeat.set(3, 3);
+        texture.wrapS = texture.wrapT = THREE.MirroredRepeatWrapping;
+
+        // var pingPhaseFramebuffer = new THREE.WebGLRenderTarget(this.resolution, this.resolution, NearestClampParams);
+        // var pongPhaseFramebuffer = new THREE.WebGLRenderTarget(this.resolution, this.resolution, NearestClampParams);
+        var pingTransformFramebuffer = new THREE.WebGLRenderTarget(resolution_x, resolution_y, this.NearestClampParams);
+        var pongTransformFramebuffer = new THREE.WebGLRenderTarget(resolution_x, resolution_y, this.NearestClampParams);
+        var displacementMapFramebuffer = new THREE.WebGLRenderTarget(resolution_x, resolution_y, this.LinearRepeatParams);
+
+        perf = performance.now();
+
+        var horizontal_iterations = Math.log2(resolution_x);
+        var vertical_iterations = Math.log2(resolution_y);
+        var iterations = horizontal_iterations + vertical_iterations;
+        
+        this.scene.overrideMaterial = this.horizontal_fft_material;
+        var subtransformProgram = this.horizontal_fft_material;
+        
+        var frameBuffer;
+        var inputBuffer;
+        subtransformProgram.uniforms.u_subtransformSize.value = 1;
+        
+        for (var i = 0; i < iterations; ++i) 
+        {
+            if (i === 0) 
+            {
+                inputBuffer = texture;
+                frameBuffer = pingTransformFramebuffer;
+            }
+            else if (i === iterations - 1)
+            {
+                inputBuffer = ((iterations % 2 === 0) ? pingTransformFramebuffer.texture : pongTransformFramebuffer.texture);
+                frameBuffer = displacementMapFramebuffer;
+            }
+            else if (i % 2 === 1)
+            {
+                inputBuffer = pingTransformFramebuffer.texture;
+                frameBuffer = pongTransformFramebuffer;
+            }
+            else
+            {
+                inputBuffer = pongTransformFramebuffer.texture;
+                frameBuffer = pingTransformFramebuffer;
+            }
+            
+            if (i === horizontal_iterations)
+            {
+                subtransformProgram = this.vertical_fft_material;
+                this.scene.overrideMaterial = this.vertical_fft_material;
+                subtransformProgram.uniforms.u_subtransformSize.value = 1;
+            }
+            
+            subtransformProgram.uniforms.u_input.value = inputBuffer;
+            subtransformProgram.uniforms.u_subtransformSize.value *= 2;
+
+            this.renderer.render(this.scene, this.fft_camera, frameBuffer);
+        }
+        
+        console.log(`Rendering took ${performance.now() - perf}`);        
+        
+        perf = performance.now();
+        
+        var pixels = new Float32Array(resolution_x * resolution_y * 4);
+    
+        var gl = this.renderer.context;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.renderer.properties.get(frameBuffer).__webglFramebuffer);
+        gl.readPixels(0, 0, resolution_x, resolution_y, gl.RGBA, gl.FLOAT, pixels);
+        
+        var real = new Array(resolution_x * resolution_y);
+        var im = new Array(resolution_x * resolution_y);
+        
+        for (var i = 0; i < real.length; ++i)
+        {
+            real[i] = pixels[4 * i];
+            im[i] = pixels[4 * i + 1];
+        }
+        
+        console.log(`Downloading took ${performance.now() - perf}`);
+        
+        return {
+          re: real,
+          im: im,
+          width:  resolution_x,
+          height:  resolution_y,
+          channels: 1
+        }
+    }
+}
+
+function webgl_fft_(matrix) {
+    var max_size = 4 * matrix.re.length;
+    var image = [];
+    for (var i = 0, j = 0; i < max_size; i += 4, ++j)
+    {
+        image[i] = matrix.re[j];
+        image[i+1] = matrix.im[j];
+        image[i+2] = 0;
+        image[i+3] = 0;
+    }
+    
+    
+    
+    var texture = createTextureFromData(renderer, resolution_x, resolution_y, image);
+    
+    texture.repeat.set(3, 3);
+    texture.wrapS = texture.wrapT = THREE.MirroredRepeatWrapping;
+
+    // var pingPhaseFramebuffer = new THREE.WebGLRenderTarget(this.resolution, this.resolution, NearestClampParams);
+    // var pongPhaseFramebuffer = new THREE.WebGLRenderTarget(this.resolution, this.resolution, NearestClampParams);
+    var pingTransformFramebuffer = new THREE.WebGLRenderTarget(resolution_x, resolution_y, NearestClampParams);
+    var pongTransformFramebuffer = new THREE.WebGLRenderTarget(resolution_x, resolution_y, NearestClampParams);
+    var displacementMapFramebuffer = new THREE.WebGLRenderTarget(resolution_x, resolution_y, LinearRepeatParams);
+
+    function renderSpectrumFFT()
+    {      
+        var horizontal_iterations = Math.log2(resolution_x);
+        var vertical_iterations = Math.log2(resolution_y);
+        var iterations = horizontal_iterations + vertical_iterations;
+        
+        scene.overrideMaterial = horizontal_fft_material;
+        var subtransformProgram = horizontal_fft_material;
+        
+        var frameBuffer;
+        var inputBuffer;
+        subtransformProgram.uniforms.u_subtransformSize.value = 1;
+        
+        for (var i = 0; i < iterations; ++i) 
+        {
+            if (i === 0) 
+            {
+                inputBuffer = texture;
+                frameBuffer = pingTransformFramebuffer;
+            }
+            else if (i === iterations - 1)
+            {
+                inputBuffer = ((iterations % 2 === 0) ? pingTransformFramebuffer.texture : pongTransformFramebuffer.texture);
+                frameBuffer = displacementMapFramebuffer;
+            }
+            else if (i % 2 === 1)
+            {
+                inputBuffer = pingTransformFramebuffer.texture;
+                frameBuffer = pongTransformFramebuffer;
+            }
+            else
+            {
+                inputBuffer = pongTransformFramebuffer.texture;
+                frameBuffer = pingTransformFramebuffer;
+            }
+            
+            if (i === horizontal_iterations)
+            {
+                subtransformProgram = vertical_fft_material;
+                scene.overrideMaterial = vertical_fft_material;
+                subtransformProgram.uniforms.u_subtransformSize.value = 1;
+            }
+            
+            subtransformProgram.uniforms.u_input.value = inputBuffer;
+            subtransformProgram.uniforms.u_subtransformSize.value *= 2;
+
+            renderer.render(scene, fft_camera, frameBuffer);
+        }
+        
+        console.log("Rendering done!");        
+        
+        var pixels = new Float32Array(resolution_x * resolution_y * 4);
+    
+        var gl = renderer.context;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, renderer.properties.get(frameBuffer).__webglFramebuffer);
+        gl.readPixels(0, 0, resolution_x, resolution_y, gl.RGBA, gl.FLOAT, pixels);
+        
+        var real = new Array(resolution_x * resolution_y);
+        var im = new Array(resolution_x * resolution_y);
+        
+        for (var i = 0; i < real.length; ++i)
+        {
+            real[i] = pixels[4 * i];
+            im[i] = pixels[4 * i + 1];
+        }
+        
+        return {
+          re: real,
+          im: im,
+          width:  resolution_x,
+          height:  resolution_y,
+          channels: 1
+        };
+    }
+
+    var res = renderSpectrumFFT();
+    
+    console.log('WebGL Done!');
+    
+    return res;
+}
+
+function complex_abs(matrix)
+{
+    var size = matrix.width * matrix.height;
+    for (var i = 0; i < size; ++i) 
+    {
+        matrix.re[i] = Math.sqrt(Math.pow(matrix.re[i], 2) + Math.pow(matrix.im[i], 2));
+        matrix.im[i] = 0;
+    }
+}
+
+function normalize(matrix) {
+    var max = new Array(matrix.channels);
+    var min = new Array(matrix.channels);
+    
+    for (var i = 0; i < matrix.channels; ++i)
+    {
+        max[i] = matrix.re[i];
+        min[i] = matrix.re[i];
+    }
+    
+    var size = matrix.width * matrix.height;
+    for (var i = 0; i < size; ++i) 
+    {
+        for (var c = 0; c < matrix.channels; ++c)
+        {
+            max[c] = Math.max(max[c], matrix.re[i + c]);
+            min[c] = Math.min(min[c], matrix.re[i + c]);
+        }
+    }
+    
+    for (var i = 0; i < size; ++i) 
+    {
+        for (var c = 0; c < matrix.channels; ++c)
+        {
+            matrix.re[i + c] = (matrix.re[i + c] - min[c]) / (max[c] - min[c]) * 255;
+        }
+    }
+}
+
+function grayscale(image) {    
+    var canvas = document.createElement('canvas');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    var ctx = canvas.getContext('2d')
+    ctx.drawImage(image, 0, 0, image.width, image.height);
+    
+    var image_data = ctx.getImageData(0, 0, image.width, image.height);
+    var data_buffer = image_data.data;
+    
+    var width = image.width;
+    var size = image.width * image.height;
+    
+    var re = [], im = [];
+    for (var i = 0, j = 0; i < data_buffer.length; i += 4, ++j) {
+        re[j] = (data_buffer[i] + data_buffer[i+1] + data_buffer[i+2]) / 3;
+        im[j] = 0.0;
+    }
+    
+    return {
+        re: re,
+        im: im,
+        width: image.width,
+        height: image.height,
+        channels: 1
+    };
+}
+
+function js_fft(matrix) {
+    FFT.init(matrix.width);
+    
+    FFT.fft2d(matrix.re, matrix.im);
+    // 
+    
+    // var absolute = [];
+    // var size = matrix.width * matrix.width;
+    
+    // absolute[0] = matrix.re[0];
+    
+    // var min = absolute[0];
+    // var max = absolute[0];
+    
+    // for (var i = 1; i < size; ++i)
+    // {
+    //     absolute[i] = matrix.re[i];
+    //     min = Math.min(absolute[i], min);
+    //     max = Math.max(absolute[i], max);
+    // }
+
+    // for (var i = 0; i < absolute.length; ++i)
+    //     absolute[i] = (absolute[i] - min) / (max - min) * 255;
+        
+    // var fourier_image = create_canvas_from_matrix({
+    //     re: absolute,
+    //     width: image.width,
+    //     height: image.width,
+    //     channels: 1
+    // });
+    // appendImageToBody(fourier_image);
+    
+    // absolute[0] = matrix.im[0];
+    
+    // min = absolute[0];
+    // max = absolute[0];
+    
+    // for (var i = 1; i < size; ++i)
+    // {
+    //     absolute[i] = matrix.im[i];
+    //     min = Math.min(absolute[i], min);
+    //     max = Math.max(absolute[i], max);
+    // }
+
+    // for (var i = 0; i < absolute.length; ++i)
+    //     absolute[i] = (absolute[i] - min) / (max - min) * 255;
+        
+    // var fourier_image = create_canvas_from_matrix({
+    //     re: absolute,
+    //     width: image.width,
+    //     height: image.width,
+    //     channels: 1
+    // });
+    // appendImageToBody(fourier_image);
+    
+    console.log("JS Done!");
+}
+
+var image = new Image();
+image.src = "images/lena.png";
+
+image.onload = function() {
+    var matrix = grayscale(image);
+    
+    var grayscale_url = create_canvas_from_matrix(matrix);
+    appendImageToBody(grayscale_url);
+    
+    FrequencyFilter.init(matrix.width);
+    
+    var fft_calculator = new webgl_fft();
+    
+    var gpu_start = performance.now();
+    
+    var fft_1 = fft_calculator.calculate(matrix);
+    
+    var gpu_end = performance.now();
+    
+    FrequencyFilter.swap(fft_1.re, fft_1.im);
+    fft_1.re = fft_1.im;
+    normalize(fft_1);
+    appendImageToBody(create_canvas_from_matrix(fft_1));
+    
+    // var cpu_start = performance.now();
+    
+    // js_fft(matrix);
+    
+    // var cpu_end = performance.now();
+    
+    // FrequencyFilter.swap(matrix.re, matrix.im);
+    // matrix.re = matrix.im;
+    // normalize(matrix);
+    // appendImageToBody(create_canvas_from_matrix(matrix));
+    
+    console.log(`Gpu took ${gpu_end - gpu_start} ms`);
+    // console.log(`Cpu took ${cpu_end - cpu_start} ms`);
+    
+};
+
+// var r = [100, 200, 150, 90, 100, 200, 150, 80];
+// var i = [0, 0, 0, 0, 0, 0, 0, 0];
+
+// var line = {
+//     re: r,
+//     im: i,
+//     width: 8,
+//     height: 1,
+//     channels: 1
+// };
+
+// var real_4 = [
+//     100, 200, 150, 90,
+//     100, 200, 150, 90,
+//     100, 200, 150, 90,
+//     100, 200, 150, 90
+// ];
+
+// var imag_4 = [
+//     0, 0, 0, 0,
+//     0, 0, 0, 0,
+//     0, 0, 0, 0,
+//     0, 0, 0, 0 
+// ];
+
+// var real_8 = [
+//     100, 200, 150, 90, 100, 200, 150, 90,
+//     100, 200, 150, 90, 100, 200, 150, 90,
+//     100, 200, 150, 90, 100, 200, 150, 90,
+//     100, 200, 150, 90, 100, 200, 150, 90,
+//     100, 200, 150, 90, 100, 200, 150, 90,
+//     100, 200, 150, 90, 100, 200, 150, 90,
+//     100, 200, 150, 90, 100, 200, 150, 90,
+//     100, 200, 150, 90, 100, 200, 150, 90
+// ];
+
+// var imag_8 = [
+//     0, 0, 0, 0, 0, 0, 0, 0,
+//     0, 0, 0, 0, 0, 0, 0, 0,
+//     0, 0, 0, 0, 0, 0, 0, 0,
+//     0, 0, 0, 0, 0, 0, 0, 0,
+//     0, 0, 0, 0, 0, 0, 0, 0,
+//     0, 0, 0, 0, 0, 0, 0, 0,
+//     0, 0, 0, 0, 0, 0, 0, 0,
+//     0, 0, 0, 0, 0, 0, 0, 0
+// ];
+
+// var matrix_8 = {
+//     re: real_8,
+//     im: imag_8,
+//     width: 8,
+//     height: 8,
+//     channels: 1
+// };
+
+// var matrix_4 = {
+//     re: real_4,
+//     im: imag_4,
+//     width: 4,
+//     height: 4,
+//     channels: 1
+// };
+
+// var matrix = matrix_8;
+
+// var grayscale_url = create_canvas_from_matrix(matrix);
+// appendImageToBody(grayscale_url);
+
+// console.log(line.re);
+// console.log(line.im);
+
+// var line_fft = webgl_fft(line);
+
+// console.log(line_fft.re);
+// console.log(line_fft.im);
+
+// FFT.init(8);
+// FFT.fft(line.re, line.im);
+
+// // js_fft(line);
+
+// console.log(line.re);
+// console.log(line.im);

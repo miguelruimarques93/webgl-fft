@@ -1,0 +1,41 @@
+{
+  "name": "wegl-fft-js",
+  "version": "1.0.0",
+  "description": "FFT and IFFT implemented in WebGL",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "npm run serve",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "bundle": "jspm bundle src/app.js bundle/main.bundle.js --minify --inject",
+    "serve": "jspm depcache src/app.js && jspm unbundle && browser-sync start --server --files '**/*.*'",
+    "jspminstall": "jspm install"
+  },
+  "keywords": [
+    "jspm",
+    "es6"
+  ],
+  "author": "migulorama &lt;migulorama@gmail.com&gt;",
+  "license": "ISC",
+  "jspm": {
+    "dependencies": {
+      "css": "github:systemjs/plugin-css@^0.1.20",
+      "json": "github:systemjs/plugin-json@^0.1.0",
+      "ml-fft": "npm:ml-fft@^1.0.5",
+      "scss": "github:mobilexag/plugin-sass@^0.2.1",
+      "text": "github:systemjs/plugin-text@^0.0.8",
+      "three": "github:mrdoob/three.js@r77",
+      "underscore": "npm:underscore@^1.8.3"
+    },
+    "devDependencies": {
+      "babel": "npm:babel-core@^5.8.24",
+      "babel-runtime": "npm:babel-runtime@^5.8.24",
+      "core-js": "npm:core-js@^1.1.4",
+      "plugin-babel": "npm:systemjs-plugin-babel@^0.0.5"
+    }
+  },
+  "devDependencies": {
+    "browser-sync": "^2.11.1",
+    "graceful-fs": "^4.1.3",
+    "jspm": "^0.16.35"
+  }
+}
